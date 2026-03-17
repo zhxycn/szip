@@ -179,7 +179,7 @@ Component FilePicker::component() {
             if (is_focused_row && focused) {
                 row = row | inverted | focus;
             } else if (is_focused_row) {
-                row = row | bold | select;
+                row = row | bold | ftxui::select;
             }
 
             rows.push_back(row);
