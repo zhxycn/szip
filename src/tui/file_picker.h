@@ -50,7 +50,9 @@ private:
     OnSubmit on_submit_;
 
     void refresh();
+    void refreshDriveList();
     bool matchesFilter(const std::filesystem::path& p) const;
+    bool at_drive_list_ = false;
     std::chrono::steady_clock::time_point last_refresh_{};
 };
 

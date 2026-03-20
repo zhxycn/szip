@@ -1,5 +1,6 @@
 #include "list_view.h"
 #include "file_picker.h"
+#include "utf8_utils.h"
 
 #include <szip/decompress.h>
 #include <szip/errors.h>
@@ -41,7 +42,7 @@ Component ListView(OnBack on_back, ResetFn* out_reset) {
     }
 
     st->picker.onSubmit([st](const std::filesystem::path& p) {
-        st->selected_archive = p.string();
+        st->selected_archive = pathToUtf8(p);
         st->error.clear();
         st->entries.clear();
         st->loaded = false;
@@ -84,8 +85,9 @@ Component ListView(OnBack on_back, ResetFn* out_reset) {
                 char crc_buf[12];
                 std::snprintf(crc_buf, sizeof(crc_buf), "%08X", e.crc32);
 
+                auto display_fn = truncateToWidth(e.filename, 22);
                 table_rows.push_back(hbox({
-                    text("  " + e.filename) | size(WIDTH, EQUAL, 25),
+                    text("  " + display_fn) | size(WIDTH, EQUAL, 25),
                     text(FilePicker::formatSize(e.original_size)) |
                         dim | size(WIDTH, EQUAL, 14),
                     text(std::to_string(e.block_count)) |

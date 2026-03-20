@@ -1,11 +1,23 @@
 #include "file_picker.h"
+#include "utf8_utils.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <sstream>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace szip::tui {
 
@@ -37,8 +49,11 @@ std::filesystem::path FilePicker::focusedPath() const {
 }
 
 void FilePicker::setDirectory(const std::filesystem::path& dir) {
-    if (std::filesystem::is_directory(dir)) {
-        current_dir_ = std::filesystem::canonical(dir);
+    std::error_code ec;
+    if (std::filesystem::is_directory(dir, ec)) {
+        auto canon = std::filesystem::canonical(dir, ec);
+        current_dir_ = ec ? dir : canon;
+        at_drive_list_ = false;
         focused_ = 0;
         refresh();
     }
@@ -48,16 +63,48 @@ void FilePicker::clearSelection() {
     selected_.clear();
 }
 
+void FilePicker::refreshDriveList() {
+#ifdef _WIN32
+    entries_.clear();
+    at_drive_list_ = true;
+
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (drives & (1u << i)) {
+            FileEntry fe;
+            std::string root = std::string(1, static_cast<char>('A' + i)) + ":\\";
+            fe.display_name = root;
+            fe.full_path = std::filesystem::path(root);
+            fe.is_directory = true;
+            entries_.push_back(std::move(fe));
+        }
+    }
+    focused_ = 0;
+    last_refresh_ = std::chrono::steady_clock::now();
+#endif
+}
+
 void FilePicker::refresh() {
     entries_.clear();
+    at_drive_list_ = false;
 
-    if (current_dir_.has_parent_path() && current_dir_ != current_dir_.root_path()) {
+    bool at_root = (current_dir_ == current_dir_.root_path());
+
+    if (current_dir_.has_parent_path() && !at_root) {
         FileEntry parent;
         parent.display_name = "..";
         parent.full_path = current_dir_.parent_path();
         parent.is_directory = true;
         entries_.push_back(std::move(parent));
     }
+#ifdef _WIN32
+    else if (at_root) {
+        FileEntry parent;
+        parent.display_name = "..";
+        parent.is_directory = true;
+        entries_.push_back(std::move(parent));
+    }
+#endif
 
     std::vector<FileEntry> dirs;
     std::vector<FileEntry> files;
@@ -65,13 +112,13 @@ void FilePicker::refresh() {
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(current_dir_, ec)) {
         if (!config_.show_hidden) {
-            auto name = entry.path().filename().string();
+            auto name = pathToUtf8(entry.path().filename());
             if (!name.empty() && name[0] == '.') continue;
         }
 
         FileEntry fe;
         fe.full_path = entry.path();
-        fe.display_name = entry.path().filename().string();
+        fe.display_name = pathToUtf8(entry.path().filename());
         fe.is_directory = entry.is_directory(ec);
 
         if (fe.is_directory) {
@@ -99,7 +146,7 @@ void FilePicker::refresh() {
 
 bool FilePicker::matchesFilter(const std::filesystem::path& p) const {
     if (config_.extension_filter.empty()) return true;
-    auto filename = p.filename().string();
+    auto filename = pathToUtf8(p.filename());
     for (const auto& ext : config_.extension_filter) {
         if (filename.size() >= ext.size() &&
             filename.compare(filename.size() - ext.size(), ext.size(), ext) == 0) {
@@ -135,8 +182,14 @@ Component FilePicker::component() {
     auto renderer = Renderer([self](bool focused) {
         auto now = std::chrono::steady_clock::now();
         if (now - self->last_refresh_ > std::chrono::seconds(2)) {
-            self->refresh();
+            if (self->at_drive_list_)
+                self->refreshDriveList();
+            else
+                self->refresh();
         }
+
+        auto term_size = Terminal::Size();
+        int max_name_width = std::max(20, term_size.dimx / 2);
 
         Elements rows;
 
@@ -146,7 +199,8 @@ Component FilePicker::component() {
             bool is_focused_row = (i == self->focused_);
 
             std::string prefix;
-            if (self->config_.multi_select && entry.display_name != "..") {
+            if (self->config_.multi_select && entry.display_name != ".." &&
+                !self->at_drive_list_) {
                 prefix = is_selected ? "[x] " : "[ ] ";
             } else if (entry.is_directory) {
                 prefix = "[D] ";
@@ -155,12 +209,16 @@ Component FilePicker::component() {
             }
 
             std::string display_name = entry.display_name;
-            if (entry.is_directory && entry.display_name != "..") {
+            if (entry.is_directory && entry.display_name != ".." &&
+                !self->at_drive_list_) {
                 display_name += "/";
             }
+            display_name = truncateToWidth(display_name, max_name_width);
 
             std::string size_str;
-            if (!entry.is_directory && entry.display_name != "..") {
+            if (self->at_drive_list_) {
+                // drives show no size
+            } else if (!entry.is_directory && entry.display_name != "..") {
                 size_str = formatSize(entry.size);
             } else if (entry.is_directory && entry.display_name != "..") {
                 size_str = "<DIR>";
@@ -193,16 +251,29 @@ Component FilePicker::component() {
                          yflex;
 
         Elements content;
-        content.push_back(hbox({
-            text(" "),
-            text(self->current_dir_.string()) | bold | color(Color::Yellow),
-        }));
+
+        if (self->at_drive_list_) {
+            content.push_back(hbox({
+                text(" "),
+                text("Select Drive") | bold | color(Color::Yellow),
+            }));
+        } else {
+            auto path_str = pathToUtf8(self->current_dir_);
+            path_str = truncateToWidth(path_str, std::max(10, term_size.dimx - 4));
+            content.push_back(hbox({
+                text(" "),
+                text(path_str) | bold | color(Color::Yellow),
+            }));
+        }
+
         content.push_back(separator());
         content.push_back(file_list | flex);
         content.push_back(separator());
 
         std::string hint;
-        if (self->config_.multi_select) {
+        if (self->at_drive_list_) {
+            hint = " Enter:open drive  Backspace:return";
+        } else if (self->config_.multi_select) {
             hint = " Space:select  Enter:open dir  Backspace:up  ";
             auto sel_count = self->selected_.size();
             if (sel_count > 0) {
@@ -255,7 +326,8 @@ Component FilePicker::component() {
             return true;
         }
 
-        if (event == Event::Character(' ') && self->config_.multi_select) {
+        if (event == Event::Character(' ') && self->config_.multi_select &&
+            !self->at_drive_list_) {
             const auto& entry = self->entries_[self->focused_];
             if (entry.display_name != "..") {
                 if (self->selected_.count(entry.full_path)) {
@@ -272,7 +344,11 @@ Component FilePicker::component() {
         if (event == Event::Return) {
             const auto& entry = self->entries_[self->focused_];
             if (entry.is_directory) {
-                self->setDirectory(entry.full_path);
+                if (entry.full_path.empty()) {
+                    self->refreshDriveList();
+                } else {
+                    self->setDirectory(entry.full_path);
+                }
             } else if (!self->config_.multi_select) {
                 self->selected_.clear();
                 self->selected_.insert(entry.full_path);
@@ -284,8 +360,12 @@ Component FilePicker::component() {
         }
 
         if (event == Event::Backspace) {
-            if (self->current_dir_.has_parent_path() &&
-                self->current_dir_ != self->current_dir_.root_path()) {
+            if (self->at_drive_list_) return true;
+            if (self->current_dir_ == self->current_dir_.root_path()) {
+                self->refreshDriveList();
+                return true;
+            }
+            if (self->current_dir_.has_parent_path()) {
                 self->setDirectory(self->current_dir_.parent_path());
             }
             return true;
